@@ -1,0 +1,244 @@
+#!/system/bin/sh
+# ============================================================================
+# thermalctl —— ThermalRelax 命令行（放在模块 bin/ 下，安装时软链到 /data/adb/thermal-relax/bin）
+#
+#   thermalctl status            当前温度/频率/档位/兜底状态
+#   thermalctl config            打印用户配置
+#   thermalctl set KEY VALUE     改配置（改完记得 thermalctl apply 或重启）
+#   thermalctl apply             立即应用 relaxed
+#   thermalctl stock             立即回滚原厂温控
+#   thermalctl release           释放残留的 max_freq clamp
+#   thermalctl restart           重启看门狗
+#   thermalctl log [行数]        看日志（默认 40 行）
+#   thermalctl diagnose          导出全量诊断到 /sdcard/Download/
+# ============================================================================
+SELF=$(readlink -f "$0" 2>/dev/null)
+[ -n "$SELF" ] || SELF=$0
+MODDIR=$(dirname "$(dirname "$SELF")")
+[ -f "$MODDIR/common/util.sh" ] || {
+	echo "找不到 $MODDIR/common/util.sh，thermalctl 必须在模块 bin/ 目录下运行"
+	exit 1
+}
+. "$MODDIR/common/util.sh"
+
+VER=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null)
+
+fmt_t() { # 毫摄氏度 -> 52.3
+	_m=$1
+	case "$_m" in '' | *[!0-9-]*) printf '%s' "$_m"; return ;; esac
+	if [ "$_m" -lt 0 ]; then
+		_m=$((0 - _m))
+		printf -- '-%d.%d' $(((_m / 100) / 10)) $(((_m / 100) % 10))
+		return
+	fi
+	printf '%d.%d' $(((_m / 100) / 10)) $(((_m / 100) % 10))
+}
+
+cmd_status() {
+	tr_ensure_dirs
+	_prof=$(tr_profile)
+	_hb=$(cat "$TR_STATE/heartbeat" 2>/dev/null)
+	printf '\n ThermalRelax %s  ·  %s\n' "${VER:-?}" "$(getprop ro.product.device)"
+	printf ' 档位        : %s\n' "$_prof"
+	_svc=$(tr_thermal_service | tr '\n' ' ')
+	printf ' 温控服务    : %s\n' "${_svc:-未找到 rc 定义}"
+	if tr_thermal_service_running; then printf ' 服务状态    : running\n'; else printf ' 服务状态    : 未运行\n'; fi
+	if [ -f "$TR_MANIFEST" ]; then
+		printf ' 配置放宽    : %s 个文件\n' "$(grep -c . "$TR_MANIFEST" 2>/dev/null)"
+		while IFS='|' read -r _d _s _p; do
+			[ -n "$_d" ] || continue
+			_c=$(tr_sha "$_d")
+			if [ "$_c" = "$_p" ]; then _st='已生效'; else _st='未生效(原厂)'; fi
+			printf '   %-34s %s\n' "$(basename "$_d")" "$_st"
+		done <"$TR_MANIFEST"
+	else
+		printf ' 配置放宽    : 无（未找到 vendor 温控配置）\n'
+	fi
+
+	printf '\n 温度\n'
+	tr_zone_list
+	if [ -s "$TR_STATE/zones.list" ]; then
+		while IFS='|' read -r _z _t; do
+			[ -n "$_z" ] || continue
+			_v=$(tr_temp_mc "$_z/temp") || continue
+			printf '   %-18s %6s°C\n' "$_t" "$(fmt_t "$_v")"
+		done <"$TR_STATE/zones.list"
+	else
+		printf '   (无可用 thermal_zone)\n'
+	fi
+	_bt=$(tr_batt_mc)
+	[ -n "$_bt" ] && printf '   %-18s %6s°C\n' 'battery' "$(fmt_t "$_bt")"
+
+	printf '\n CPU\n'
+	for _p in /sys/devices/system/cpu/cpufreq/policy*; do
+		[ -d "$_p" ] || continue
+		_cur=$(cat "$_p/scaling_cur_freq" 2>/dev/null)
+		_mx=$(cat "$_p/scaling_max_freq" 2>/dev/null)
+		_hw=$(cat "$_p/cpuinfo_max_freq" 2>/dev/null)
+		_gov=$(cat "$_p/scaling_governor" 2>/dev/null)
+		_cl='ok'
+		case "$_mx" in '' | *[!0-9]*) _cl='?' ;; *) [ "$_mx" -lt "$_hw" ] && _cl='被压制' ;; esac
+		printf '   %-8s %-12s cur=%-8s max=%-8s hw=%-8s %s\n' \
+			"$(basename "$_p")" "$_gov" "$_cur" "$_mx" "$_hw" "$_cl"
+	done
+
+	_k=/sys/class/kgsl/kgsl-3d0
+	if [ -d "$_k" ]; then
+		printf '\n GPU\n'
+		printf '   freq=%s  max=%s  thermal_pwrlevel=%s  idle_timer=%s\n' \
+			"$(cat "$_k/gpuclk" 2>/dev/null || cat "$_k/devfreq/cur_freq" 2>/dev/null)" \
+			"$(cat "$_k/max_gpuclk" 2>/dev/null || cat "$_k/devfreq/max_freq" 2>/dev/null)" \
+			"$(cat "$_k/thermal_pwrlevel" 2>/dev/null)" \
+			"$(cat "$_k/idle_timer" 2>/dev/null)"
+	fi
+
+	printf '\n 兜底\n'
+	printf '   hot=%s°C  crit=%s°C  batt=%s°C  cool=%s°C\n' \
+		"$(fmt_t "$(tr_cfg GUARD_HOT_MC 80000)")" \
+		"$(fmt_t "$(tr_cfg GUARD_CRIT_MC 86000)")" \
+		"$(fmt_t "$(tr_cfg BATT_HOT_MC 45000)")" \
+		"$(fmt_t "$(tr_cfg GUARD_COOL_MC 55000)")"
+	if [ -n "$_hb" ]; then
+		set -- $_hb
+		_age=$(($(date +%s) - $1))
+		printf '   看门狗      : 心跳 %ss 前（最热 %s°C，电池 %s°C）\n' \
+			"$_age" "$(fmt_t "$2")" "$(fmt_t "$3")"
+	else
+		printf '   看门狗      : 无心跳（未启动？）\n'
+	fi
+	printf '   日志        : %s\n\n' "$TR_LOG"
+}
+
+cmd_diagnose() {
+	_out='/sdcard/Download'
+	[ -d "$_out" ] || _out=/sdcard
+	_f="$_out/thermal-relax-diag-$(date +%Y%m%d-%H%M%S).txt"
+	{
+		echo "== ThermalRelax diag =="
+		echo "time: $(date '+%F %T')  version: ${VER:-?}"
+		echo
+		echo '-- props --'
+		getprop | grep -Ei 'product\.(device|model|name)|lineage|build\.(display|fingerprint)|thermal|miui' | head -n 60
+		echo
+		echo '-- modules --'
+		ls -l /data/adb/modules 2>/dev/null
+		echo
+		echo '-- thermal zones --'
+		for _z in /sys/class/thermal/thermal_zone*; do
+			[ -d "$_z" ] || continue
+			printf '%-28s %-26s %s\n' "$(basename "$_z")" "$(cat "$_z/type" 2>/dev/null)" "$(cat "$_z/temp" 2>/dev/null)"
+		done
+		echo
+		echo '-- cooling devices --'
+		for _c in /sys/class/thermal/cooling_device*; do
+			[ -d "$_c" ] || continue
+			printf '%-24s %-20s cur=%s max=%s\n' "$(basename "$_c")" "$(cat "$_c/type" 2>/dev/null)" \
+				"$(cat "$_c/cur_state" 2>/dev/null)" "$(cat "$_c/max_state" 2>/dev/null)"
+		done
+		echo
+		echo '-- cpufreq --'
+		for _p in /sys/devices/system/cpu/cpufreq/policy*; do
+			[ -d "$_p" ] || continue
+			echo "[$(basename "$_p")] gov=$(cat "$_p/scaling_governor" 2>/dev/null) cur=$(cat "$_p/scaling_cur_freq" 2>/dev/null) min=$(cat "$_p/scaling_min_freq" 2>/dev/null) max=$(cat "$_p/scaling_max_freq" 2>/dev/null) hwmax=$(cat "$_p/cpuinfo_max_freq" 2>/dev/null)"
+			ls "$_p" "$_p/schedutil" 2>/dev/null | tr '\n' ' '
+			echo
+			for _f in rate_limit_us up_rate_limit_us down_rate_limit_us hispeed_freq; do
+				[ -r "$_p/schedutil/$_f" ] && echo "   schedutil/$_f=$(cat "$_p/schedutil/$_f")"
+			done
+		done
+		echo
+		echo '-- kgsl --'
+		for _f in gpuclk max_gpuclk min_gpuclk thermal_pwrlevel default_pwrlevel min_pwrlevel idle_timer force_clk_on devfreq/governor devfreq/cur_freq devfreq/max_freq devfreq/adrenoboost; do
+			[ -r "/sys/class/kgsl/kgsl-3d0/$_f" ] && echo "$_f=$(cat "/sys/class/kgsl/kgsl-3d0/$_f" 2>/dev/null)"
+		done
+		echo
+		echo '-- core_ctl --'
+		for _c in /sys/devices/system/cpu/cpu*/core_ctl; do
+			[ -d "$_c" ] || continue
+			echo "[$(echo "$_c" | cut -d/ -f6)] $(cat "$_c/enable" 2>/dev/null) min=$(cat "$_c/min_cpus" 2>/dev/null) max=$(cat "$_c/max_cpus" 2>/dev/null)"
+		done
+		echo
+		echo '-- thermal services --'
+		service list 2>/dev/null | grep -i thermal
+		echo "rc: $(tr_thermal_service | tr '\n' ' ')"
+		echo "hal_running: $(tr_thermal_service_running && echo yes || echo no)"
+		echo
+		echo '-- vendor thermal configs --'
+		ls -l /vendor/etc/*thermal* 2>/dev/null
+		echo "manifest:"; cat "$TR_MANIFEST" 2>/dev/null
+		for _f in /vendor/etc/thermal-engine*.conf; do
+			[ -f "$_f" ] || continue
+			echo "[$_f] sha=$(tr_sha "$_f") lines=$(wc -l <"$_f" 2>/dev/null)"
+		done
+		echo
+		echo '-- stock vs patched diff --'
+		for _f in "$TR_STOCK"/*; do
+			[ -f "$_f" ] || continue
+			echo "[diff $(basename "$_f")]"
+			diff -u "$_f" "$TR_PATCHED/$(basename "$_f")" 2>/dev/null | head -n 80
+		done
+		echo
+		echo '-- config --'
+		cat "$TR_DIR/config.conf" 2>/dev/null
+		echo
+		echo '-- env snapshot --'
+		cat "$TR_STATE/env.snapshot" 2>/dev/null
+		echo
+		echo '-- log (tail 200) --'
+		tail -n 200 "$TR_LOG" 2>/dev/null
+	} >"$_f" 2>&1
+	echo "诊断已导出: $_f"
+	echo "（把这个文件回传，就能按你的 ROM 实际配置精调阈值）"
+}
+
+case "$1" in
+status | '') cmd_status ;;
+config) cat "$TR_DIR/config.conf" 2>/dev/null || echo '暂无配置，运行 thermalctl 一次即可生成' ;;
+set)
+	[ -n "$2" ] && [ -n "$3" ] || {
+		echo '用法: thermalctl set KEY VALUE'
+		exit 1
+	}
+	tr_cfg_set "$2" "$3" && echo "已写入 $2=$3（执行 thermalctl apply 生效，或重启）"
+	;;
+apply)
+	# 配置可能被改过，重建放宽版再顶上（不需要重启手机）
+	sh "$MODDIR/tools/gen_overlay.sh" "$MODDIR"
+	tr_apply_relaxed
+	echo '已重新生成放宽版并应用 relaxed 档'
+	;;
+stock)
+	tr_apply_stock
+	echo '已回到 stock 档（原厂温控）'
+	;;
+release)
+	tr_release_clamp
+	echo '已尝试释放 max_freq clamp'
+	;;
+restart)
+	_pid=$(cat "$TR_PIDFILE" 2>/dev/null)
+	[ -n "$_pid" ] && kill "$_pid" 2>/dev/null
+	sleep 1
+	( sh "$MODDIR/service.sh" >/dev/null 2>&1 & )
+	echo '看门狗已重启'
+	;;
+log)
+	tail -n "${2:-40}" "$TR_LOG" 2>/dev/null || echo '暂无日志'
+	;;
+diagnose) cmd_diagnose ;;
+*)
+	cat <<'EOF'
+thermalctl —— ThermalRelax 控制台
+
+  status            温度/频率/档位/兜底状态
+  config            打印用户配置
+  set KEY VALUE     改配置（之后 thermalctl apply 或重启）
+  apply             立即应用 relaxed
+  stock             立即回滚原厂温控
+  release           释放残留 max_freq clamp
+  restart           重启看门狗
+  log [行数]        看日志
+  diagnose          导出全量诊断到 /sdcard/Download/
+EOF
+	;;
+esac

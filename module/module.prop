@@ -1,0 +1,6 @@
+id=thermal_relax_equuleus
+name=ThermalRelax • Mi8Pro/LineageOS
+version=v1.0.0
+versionCode=10000
+author=YG
+description=放宽 LineageOS 在小米8 Pro (equuleus/SDM845) 上过于保守的低负载降频策略：抬高温控阈值、给降频设下限、修掉脏 clamp 与静态调度限制；保留 LMH 硬件兜底、过温自动回滚原厂配置。
